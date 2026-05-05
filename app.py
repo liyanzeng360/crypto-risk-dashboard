@@ -52,18 +52,46 @@ div[data-testid="stMetricValue"] {
 DEFAULT_ASSETS = ["BTC-USD", "ETH-USD", "SOL-USD", "BNB-USD", "XRP-USD", "ADA-USD"]
 TRADING_DAYS = 365  # crypto markets trade 24/7
 
+import time
+
+def _fetch_one(symbol, start, end, attempts=3, sleep=1.5):
+    """Fetch a single ticker with retry. Yahoo Finance occasionally returns empty
+    data on batch requests; per-symbol retries dramatically improve reliability."""
+    for i in range(attempts):
+        try:
+            df = yf.download(symbol, start=start, end=end,
+                             progress=False, auto_adjust=False, threads=False)
+            if df is not None and not df.empty and "Close" in df.columns:
+                return df
+        except Exception:
+            pass
+        if i < attempts - 1:
+            time.sleep(sleep)
+    return None
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_data(symbols, start, end):
-    df = yf.download(symbols, start=start, end=end, progress=False, auto_adjust=False)
+    # Step 1: try batch download (fast path)
+    df = yf.download(list(symbols), start=start, end=end,
+                     progress=False, auto_adjust=False, threads=True)
     if isinstance(df.columns, pd.MultiIndex):
         close = df["Close"].copy()
-        # Yahoo Finance reports CRYPTO "Volume" already in USD turnover (not coin count).
-        # Do NOT multiply by Close — doing so would inflate BTC ADV into the quadrillions.
-        volume_usd = df["Volume"].copy()
-    else:
-        # single asset case
+        volume_usd = df["Volume"].copy()  # Yahoo crypto Volume is already USD turnover
+    elif df is not None and not df.empty:
         close = df[["Close"]].rename(columns={"Close": symbols[0]})
         volume_usd = df[["Volume"]].rename(columns={"Volume": symbols[0]})
+    else:
+        close = pd.DataFrame()
+        volume_usd = pd.DataFrame()
+
+    # Step 2: detect any symbols that came back empty and retry individually
+    failed = [s for s in symbols if s not in close.columns or close[s].notna().sum() < 2]
+    for s in failed:
+        retry = _fetch_one(s, start, end)
+        if retry is not None and not retry.empty:
+            close[s] = retry["Close"]
+            volume_usd[s] = retry["Volume"]  # already USD turnover for crypto
+
     close = close.ffill().dropna(how="all")
     volume_usd = volume_usd.ffill().dropna(how="all")
     return close, volume_usd
