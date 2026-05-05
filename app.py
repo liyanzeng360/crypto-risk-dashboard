@@ -20,11 +20,13 @@ def load_data(symbols, start, end):
     df = yf.download(symbols, start=start, end=end, progress=False, auto_adjust=False)
     if isinstance(df.columns, pd.MultiIndex):
         close = df["Close"].copy()
-        volume_usd = (df["Volume"] * df["Close"]).copy()
+        # Yahoo Finance reports CRYPTO "Volume" already in USD turnover (not coin count).
+        # Do NOT multiply by Close — doing so would inflate BTC ADV into the quadrillions.
+        volume_usd = df["Volume"].copy()
     else:
         # single asset case
         close = df[["Close"]].rename(columns={"Close": symbols[0]})
-        volume_usd = (df["Volume"] * df["Close"]).to_frame(symbols[0])
+        volume_usd = df[["Volume"]].rename(columns={"Volume": symbols[0]})
     close = close.ffill().dropna(how="all")
     volume_usd = volume_usd.ffill().dropna(how="all")
     return close, volume_usd
