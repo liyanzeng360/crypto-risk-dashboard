@@ -75,17 +75,19 @@ def liquidity_cost(position_usd, adv_usd, sigma, lam=0.5):
 # ============================================================
 st.sidebar.title("📥 Module 1 · Portfolio Input")
 preset = st.sidebar.selectbox("Preset", ["Custom", "Balanced", "BTC-heavy", "Altcoin-heavy"])
+# Institutional-scale defaults so liquidity cost is visible against deep crypto markets
 PRESETS = {
-    "Balanced":      {"BTC-USD": 25000, "ETH-USD": 20000, "SOL-USD": 10000, "BNB-USD": 10000, "XRP-USD": 5000,  "ADA-USD": 5000},
-    "BTC-heavy":     {"BTC-USD": 60000, "ETH-USD": 20000, "SOL-USD": 5000,  "BNB-USD": 5000,  "XRP-USD": 5000,  "ADA-USD": 5000},
-    "Altcoin-heavy": {"BTC-USD": 5000,  "ETH-USD": 10000, "SOL-USD": 25000, "BNB-USD": 15000, "XRP-USD": 20000, "ADA-USD": 25000},
+    "Balanced":      {"BTC-USD": 25_000_000, "ETH-USD": 20_000_000, "SOL-USD": 10_000_000, "BNB-USD": 10_000_000, "XRP-USD": 5_000_000,  "ADA-USD": 5_000_000},
+    "BTC-heavy":     {"BTC-USD": 60_000_000, "ETH-USD": 20_000_000, "SOL-USD": 5_000_000,  "BNB-USD": 5_000_000,  "XRP-USD": 5_000_000,  "ADA-USD": 5_000_000},
+    "Altcoin-heavy": {"BTC-USD": 5_000_000,  "ETH-USD": 10_000_000, "SOL-USD": 25_000_000, "BNB-USD": 15_000_000, "XRP-USD": 20_000_000, "ADA-USD": 25_000_000},
 }
-base = PRESETS.get(preset, {a: 10000.0 for a in DEFAULT_ASSETS})
+base = PRESETS.get(preset, {a: 10_000_000.0 for a in DEFAULT_ASSETS})
 
 positions = {}
 for a in DEFAULT_ASSETS:
     positions[a] = st.sidebar.number_input(f"{a} (USD)", min_value=0.0,
-                                            value=float(base.get(a, 10000.0)), step=500.0)
+                                            value=float(base.get(a, 10_000_000.0)),
+                                            step=500_000.0, format="%.0f")
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("⚙️ Risk Parameters")
@@ -323,40 +325,50 @@ with tab4:
         shocks = {s: sc.get(s, sc["_alt"]) for s in active}
         adv_mult = sc["adv"]; lam_mult = sc["lam"]
 
-    rows = []; sc_pnl = 0.0; sc_sv = 0.0; sc_lc = 0.0
+    # Total scenario loss = |MTM loss from price shock| + Stressed Liquidity Cost
+    rows = []; sc_pnl = 0.0; sc_lc = 0.0
     for s in active:
         pos = positions[s]
         r = rets[s].dropna()
-        adv_s = float(vol_usd[s].dropna().tail(adv_window).mean()) * adv_mult
+        adv_stressed = float(vol_usd[s].dropna().tail(adv_window).mean()) * adv_mult
         sigma = ann_vol(r)
-        sv = pos * hist_var(r, conf)
-        lc = liquidity_cost(pos, adv_s, sigma, lam * lam_mult)
+        lc = liquidity_cost(pos, adv_stressed, sigma, lam * lam_mult)
         pnl = pos * shocks[s]
-        sc_pnl += pnl; sc_sv += sv; sc_lc += lc
-        rows.append({"Asset": s, "Shock": shocks[s], "P&L": pnl,
-                     "Std VaR": sv, "Liquidity Cost": lc, "L-VaR": sv + lc})
+        sc_pnl += pnl; sc_lc += lc
+        rows.append({"Asset": s, "Shock": shocks[s], "MTM P&L": pnl,
+                     "Liq Cost (stressed)": lc,
+                     "Total Loss": abs(pnl) + lc})
+
+    realized_loss = abs(sc_pnl)
+    total_stressed_loss = realized_loss + sc_lc
+    base_lvar = total_sv + total_lc
 
     a, b, c, d = st.columns(4)
-    a.metric("Scenario P&L", f"${sc_pnl:,.0f}")
-    b.metric("Std VaR (stressed)", f"${sc_sv:,.0f}")
+    a.metric("Scenario P&L (MTM)", f"${sc_pnl:,.0f}")
+    b.metric("Realized Loss", f"${realized_loss:,.0f}")
     c.metric("Liquidity Cost (stressed)", f"${sc_lc:,.0f}")
-    d.metric("L-VaR (stressed)", f"${sc_sv + sc_lc:,.0f}")
+    delta_txt = f"{(total_stressed_loss/base_lvar - 1)*100:+.0f}% vs baseline L-VaR" if base_lvar else None
+    d.metric("Total Stressed Loss", f"${total_stressed_loss:,.0f}", delta=delta_txt)
 
     df_sc = pd.DataFrame(rows)
     st.dataframe(df_sc.style.format({
-        "Shock": "{:.0%}", "P&L": "${:,.0f}", "Std VaR": "${:,.0f}",
-        "Liquidity Cost": "${:,.0f}", "L-VaR": "${:,.0f}",
+        "Shock": "{:.0%}", "MTM P&L": "${:,.0f}",
+        "Liq Cost (stressed)": "${:,.0f}", "Total Loss": "${:,.0f}",
     }), use_container_width=True, hide_index=True)
 
-    base_lvar = total_sv + total_lc
-    stressed_lvar = sc_sv + sc_lc
     fig = go.Figure(go.Waterfall(
-        x=["Baseline L-VaR", "Δ Std VaR", "Δ Liquidity Cost", "Stressed L-VaR"],
-        y=[base_lvar, sc_sv - total_sv, sc_lc - total_lc, stressed_lvar],
+        x=["Baseline L-VaR", "+ MTM shock loss", "+ Extra liquidity stress", "Total Stressed Loss"],
+        y=[base_lvar, realized_loss - total_sv, sc_lc - total_lc, total_stressed_loss],
         measure=["absolute", "relative", "relative", "total"],
     ))
     fig.update_layout(title=f"Scenario Waterfall — Baseline → {sc_name}")
     st.plotly_chart(fig, use_container_width=True)
+
+    st.caption(
+        f"Under **{sc_name}**: ${realized_loss:,.0f} mark-to-market loss from the price shock "
+        f"+ ${sc_lc:,.0f} extra to liquidate in a thinner market "
+        f"(ADV × {adv_mult:.0%}, λ × {lam_mult:.1f}) = **${total_stressed_loss:,.0f} total**."
+    )
 
 # ============================================================
 # About / Methodology
