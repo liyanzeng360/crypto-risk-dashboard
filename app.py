@@ -30,17 +30,35 @@ def load_data(symbols, start, end):
     return close, volume_usd
 
 # ============================================================
-# Risk metrics
+# Risk metrics  (defensive: return NaN on empty input)
 # ============================================================
 def log_returns(p): return np.log(p / p.shift(1)).dropna(how="all")
-def hist_var(r, c=0.95): return float(-np.quantile(r.dropna(), 1 - c))
+
+def _clean(s):
+    s = pd.Series(s).dropna()
+    return s
+
+def hist_var(r, c=0.95):
+    r = _clean(r)
+    if len(r) == 0: return float("nan")
+    return float(-np.quantile(r, 1 - c))
+
 def expected_shortfall(r, c=0.95):
+    r = _clean(r)
+    if len(r) == 0: return float("nan")
     v = hist_var(r, c); tail = r[r <= -v]
     return float(-tail.mean()) if len(tail) else v
+
 def max_drawdown(p):
+    p = _clean(p)
+    if len(p) == 0: return float("nan")
     nav = p / p.iloc[0]; dd = nav / nav.cummax() - 1
     return float(dd.min())
-def ann_vol(r): return float(r.std() * np.sqrt(365))
+
+def ann_vol(r):
+    r = _clean(r)
+    if len(r) < 2: return float("nan")
+    return float(r.std() * np.sqrt(365))
 
 # ============================================================
 # Liquidity model — the core of the project
@@ -94,7 +112,16 @@ if close.empty:
     st.error("No data returned. Try a different date range.")
     st.stop()
 
-rets = log_returns(close)
+# Drop assets that returned no usable data (yfinance can fail per-symbol)
+missing = [a for a in active if a not in close.columns or close[a].notna().sum() < 2]
+if missing:
+    st.warning(f"No data returned for: {', '.join(missing)}. Skipping these assets.")
+active = [a for a in active if a not in missing]
+if not active:
+    st.error("None of the selected assets returned usable data. Try a different date range or fewer assets.")
+    st.stop()
+
+rets = log_returns(close[active])
 total_pos = sum(positions[a] for a in active)
 weights = np.array([positions[a] / total_pos for a in active])
 port_ret = (rets[active] * weights).sum(axis=1)
