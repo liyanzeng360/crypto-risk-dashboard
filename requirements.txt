@@ -1,6 +1,7 @@
-streamlit>=1.36
-yfinance>=0.2.43
-pandas>=2.2
-numpy>=1.26
-plotly>=5.22
-scipy>=1.11
+yfinance
+pandas
+numpy
+plotly
+dash-bootstrap-components
+scipy
+streamlit
