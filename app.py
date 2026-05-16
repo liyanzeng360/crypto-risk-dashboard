@@ -1,683 +1,634 @@
-# app.py — Crypto Market & Liquidity Risk Analytics (Institutional-Grade)
-# Université de Genève · MSc Finance · Global Asset Allocation · Spring 2026
-# Author: Liyan Zeng
-# ----------------------------------------------------------------
-# Implements:
-#   • Historical / Parametric / Cornish-Fisher VaR & Expected Shortfall
-#   • Kupiec (1995) Proportion-of-Failures backtest with rolling window
-#   • Component VaR via Euler decomposition (risk-budgeting view)
-#   • Bootstrap 95% CI for portfolio VaR
-#   • Bangia et al. (1999) / Almgren-Chriss (2000) Liquidity-Adjusted VaR
-#   • Four named crash scenarios + custom stress designer
-# ----------------------------------------------------------------
-import streamlit as st
-import yfinance as yf
+"""
+Crypto Market & Liquidity Risk Dashboard
+Université de Genève · Quantitative Risk Management (Spring 26) · Group 3
+Streamlit deployment
+"""
+
+import time, traceback
 import numpy as np
 import pandas as pd
-import plotly.express as px
-import plotly.graph_objects as go
+import yfinance as yf
 from scipy import stats
-from datetime import datetime, timedelta
+import plotly.graph_objects as go
+import plotly.express as px
+import streamlit as st
 
-st.set_page_config(page_title="Crypto L-VaR Analytics", layout="wide",
-                   page_icon="📊", initial_sidebar_state="expanded")
+# ──────────────── Constants ────────────────
+TRADING_DAYS      = 365
+BRAND             = "#0B3D91"
+DEFAULT_TICKERS   = ["BTC-USD","ETH-USD","SOL-USD","BNB-USD","XRP-USD"]
+DEFAULT_POSITIONS = {"BTC":5_000_000,"ETH":3_000_000,"SOL":1_000_000,
+                      "BNB":800_000,"XRP":200_000}
+LIQ_PARTICIPATION = 0.25
 
-# === Institutional CSS ===
-st.markdown("""<style>
-.block-container { padding-top: 1.5rem; padding-bottom: 2rem; }
-div[data-testid="stMetric"] {
-    background: linear-gradient(135deg, #ffffff 0%, #f1f5f9 100%);
-    border: 1px solid #e2e8f0; border-radius: 10px; padding: 14px 18px;
+SCENARIOS = {
+    "Crypto Winter (2022-style)": {
+        "shocks":{"BTC":-0.50,"ETH":-0.60,"SOL":-0.75,"BNB":-0.55,"XRP":-0.55},
+        "adv_mult":0.40,"lambda_mult":1.5,"vol_mult":1.5,
+        "description":"Prolonged bear market: large drops, volumes contract ~60%."},
+    "Exchange Collapse (FTX-style)": {
+        "shocks":{"BTC":-0.25,"ETH":-0.30,"SOL":-0.50,"BNB":-0.55,"XRP":-0.30},
+        "adv_mult":0.20,"lambda_mult":3.0,"vol_mult":2.5,
+        "description":"Sudden venue failure, liquidity evaporates."},
+    "Stablecoin Panic": {
+        "shocks":{"BTC":-0.15,"ETH":-0.20,"SOL":-0.35,"BNB":-0.25,"XRP":-0.20},
+        "adv_mult":0.50,"lambda_mult":2.0,"vol_mult":1.8,
+        "description":"Loss of confidence in USD stablecoin."},
+    "Regulatory Shock": {
+        "shocks":{"BTC":-0.20,"ETH":-0.25,"SOL":-0.40,"BNB":-0.45,"XRP":-0.50},
+        "adv_mult":0.60,"lambda_mult":1.8,"vol_mult":2.2,
+        "description":"Major-jurisdiction enforcement action."},
 }
-div[data-testid="stMetric"] label {
-    font-size: 0.76rem !important; color: #475569 !important;
-    font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em;
-}
-div[data-testid="stMetricValue"] {
-    font-size: 1.55rem !important; font-weight: 700; color: #0f172a !important;
-}
-.stTabs [data-baseweb="tab-list"] { gap: 6px; border-bottom: 2px solid #e2e8f0; }
-.stTabs [data-baseweb="tab"] { font-size: 0.94rem; font-weight: 500; padding: 10px 18px; }
-.header-banner {
-    background: linear-gradient(135deg, #0f172a 0%, #1e40af 100%);
-    color: white; padding: 22px 28px; border-radius: 12px; margin-bottom: 22px;
-    box-shadow: 0 4px 14px rgba(15,23,42,0.15);
-}
-.header-banner h1 { color: white; margin: 0; font-size: 1.65rem; font-weight: 700; }
-.header-banner .subtitle { color: rgba(255,255,255,0.88); font-size: 0.95rem; margin-top: 4px; }
-.header-banner .meta { color: rgba(255,255,255,0.65); font-size: 0.78rem; margin-top: 10px; }
-</style>""", unsafe_allow_html=True)
 
-# === Constants ===
-DEFAULT_ASSETS = ["BTC-USD", "ETH-USD", "SOL-USD", "BNB-USD", "XRP-USD", "ADA-USD"]
-TRADING_DAYS = 365  # crypto markets trade 24/7
+# Risk Regime (Fix #2: 6 levels)
+REGIME_RULES = [
+    (-0.05, "Crisis",   "#7b241c"),
+    (-0.03, "High Risk","#c0392b"),
+    (-0.015,"Elevated", "#e67e22"),
+    ( 0.00, "Moderate", "#f0c040"),
+    ( 0.015,"Stable",   "#27ae60"),
+]
+REGIME_BULL = ("Bull", "#1a5276")
 
-import time
+
+# ──────────────── Helper Functions ────────────────
+def classify_regime(ret):
+    if pd.isna(ret): return "N/A", "#999"
+    for threshold, label, color in REGIME_RULES:
+        if ret < threshold: return label, color
+    return REGIME_BULL
 
 def _fetch_one(symbol, start, end, attempts=3, sleep=1.5):
-    """Fetch a single ticker with retry. Yahoo Finance occasionally returns empty
-    data on batch requests; per-symbol retries dramatically improve reliability."""
-    for i in range(attempts):
+    for k in range(attempts):
         try:
-            df = yf.download(symbol, start=start, end=end,
-                             progress=False, auto_adjust=False, threads=False)
-            if df is not None and not df.empty and "Close" in df.columns:
+            df = yf.download(symbol, start=start, end=end, progress=False, auto_adjust=True)
+            if df is not None and not df.empty:
                 return df
         except Exception:
             pass
-        if i < attempts - 1:
-            time.sleep(sleep)
+        time.sleep(sleep*(k+1))
     return None
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def load_data(symbols, start, end):
-    # Step 1: try batch download (fast path)
-    df = yf.download(list(symbols), start=start, end=end,
-                     progress=False, auto_adjust=False, threads=True)
-    if isinstance(df.columns, pd.MultiIndex):
-        close = df["Close"].copy()
-        volume_usd = df["Volume"].copy()  # Yahoo crypto Volume is already USD turnover
-    elif df is not None and not df.empty:
-        close = df[["Close"]].rename(columns={"Close": symbols[0]})
-        volume_usd = df[["Volume"]].rename(columns={"Volume": symbols[0]})
-    else:
-        close = pd.DataFrame()
-        volume_usd = pd.DataFrame()
+@st.cache_data(ttl=3600, show_spinner="Loading market data...")
+def load_features(tickers, start_str, end_str):
+    start, end = pd.Timestamp(start_str), pd.Timestamp(end_str)
+    frames, missing = [], []
+    for s in tickers:
+        df = _fetch_one(s, start, end)
+        if df is None or df.empty:
+            missing.append(s); continue
+        sub = df.reset_index()
+        sub.columns = [c if not isinstance(c, tuple) else c[0] for c in sub.columns]
+        sub = sub.rename(columns={"Date":"date","Close":"close","Volume":"volume"})
+        sub["asset"]      = s.split("-")[0]
+        sub["volume_usd"] = sub["volume"]
+        frames.append(sub[["date","asset","close","volume","volume_usd"]])
+    if not frames:
+        return None, missing
+    raw = pd.concat(frames, ignore_index=True)
+    raw["date"] = pd.to_datetime(raw["date"])
+    raw = raw.sort_values(["asset","date"]).reset_index(drop=True)
+    g = raw.groupby("asset", group_keys=False)
+    raw["return"]         = g["close"].pct_change()
+    raw["norm_price"]     = g["close"].transform(lambda s: s/s.iloc[0])
+    raw["rolling_vol_30"] = (g["return"].rolling(30).std()
+                             .reset_index(level=0, drop=True) * np.sqrt(TRADING_DAYS))
+    raw["cum_max"]    = g["close"].cummax()
+    raw["drawdown"]   = raw["close"] / raw["cum_max"] - 1.0
+    raw["adv_30_usd"] = g["volume_usd"].rolling(30).mean().reset_index(level=0, drop=True)
+    return raw, missing
 
-    # Step 2: detect any symbols that came back empty and retry individually
-    failed = [s for s in symbols if s not in close.columns or close[s].notna().sum() < 2]
-    for s in failed:
-        retry = _fetch_one(s, start, end)
-        if retry is not None and not retry.empty:
-            close[s] = retry["Close"]
-            volume_usd[s] = retry["Volume"]  # already USD turnover for crypto
-
-    close = close.ffill().dropna(how="all")
-    volume_usd = volume_usd.ffill().dropna(how="all")
-    return close, volume_usd
-
-# === Risk metrics (defensive against empty input) ===
-def log_returns(p): return np.log(p / p.shift(1)).dropna(how="all")
-
-def _clean(s): return pd.Series(s).dropna()
-
-def hist_var(r, c=0.95):
-    r = _clean(r)
-    if len(r) == 0: return float("nan")
-    return float(-np.quantile(r, 1 - c))
-
-def parametric_var(r, c=0.95):
-    """Gaussian VaR (Risk-Metrics-style): VaR = -(mu + z_(1-c) * sigma)."""
-    r = _clean(r)
-    if len(r) < 2: return float("nan")
-    return float(-(r.mean() + stats.norm.ppf(1 - c) * r.std()))
-
-def cornish_fisher_var(r, c=0.95):
-    """Cornish-Fisher (1937) VaR — corrects the Gaussian quantile for empirical skew & excess kurtosis (fat tails)."""
-    r = _clean(r)
-    if len(r) < 4: return float("nan")
-    mu, sg = r.mean(), r.std()
-    s = float(stats.skew(r)); k = float(stats.kurtosis(r))
-    z = stats.norm.ppf(1 - c)
-    z_cf = z + (z**2 - 1)*s/6 + (z**3 - 3*z)*k/24 - (2*z**3 - 5*z)*(s**2)/36
-    return float(-(mu + z_cf * sg))
-
-def expected_shortfall(r, c=0.95):
-    r = _clean(r)
-    if len(r) == 0: return float("nan")
-    v = hist_var(r, c); tail = r[r <= -v]
-    return float(-tail.mean()) if len(tail) else v
-
-def max_drawdown(p):
-    p = _clean(p)
-    if len(p) == 0: return float("nan")
-    nav = p / p.iloc[0]; dd = nav / nav.cummax() - 1
-    return float(dd.min())
-
-def ann_vol(r):
-    r = _clean(r)
-    if len(r) < 2: return float("nan")
-    return float(r.std() * np.sqrt(TRADING_DAYS))
-
-def kupiec_pof(returns, var_func, c=0.95, window=250):
-    """Kupiec (1995) POF backtest with rolling-window VaR forecasts.
-    H0: empirical violation rate equals (1 - c). Reject if p-value < 5%."""
-    r = _clean(returns); n = len(r) - window
-    if n <= 50: return None
-    viol = 0
+def _arr(x):
+    r = np.asarray(pd.Series(x), dtype=float); return r[~np.isnan(r)]
+def hist_var(x, c=0.95):
+    r = _arr(x); return float(-np.quantile(r, 1-c)) if r.size else np.nan
+def parametric_var(x, c=0.95):
+    r = _arr(x)
+    return np.nan if r.size<2 else float(-(r.mean()+r.std(ddof=1)*stats.norm.ppf(1-c)))
+def cornish_fisher_var(x, c=0.95):
+    r = _arr(x)
+    if r.size < 4: return np.nan
+    s = float(stats.skew(r, bias=False))
+    k = float(stats.kurtosis(r, fisher=True, bias=False))
+    z = stats.norm.ppf(1-c)
+    z_cf = z+(z**2-1)*s/6+(z**3-3*z)*k/24-(2*z**3-5*z)*(s**2)/36
+    return float(-(r.mean()+r.std(ddof=1)*z_cf))
+def expected_shortfall(x, c=0.95):
+    r = _arr(x)
+    if r.size == 0: return np.nan
+    q = np.quantile(r, 1-c); tail = r[r<=q]
+    return float(-tail.mean()) if tail.size else np.nan
+def ann_vol(x):
+    r = _arr(x)
+    return float(r.std(ddof=1)*np.sqrt(TRADING_DAYS)) if r.size>1 else np.nan
+def max_drawdown(prices):
+    p = pd.Series(prices).dropna()
+    return float((p/p.cummax()-1).min()) if not p.empty else np.nan
+def kupiec_pof(returns, c=0.95, window=250):
+    r = _arr(returns)
+    if r.size <= window+5: return np.nan, np.nan, np.nan
+    breaches = n = 0
     for i in range(window, len(r)):
-        v = var_func(r.iloc[i-window:i], c)
-        if r.iloc[i] < -v: viol += 1
-    p = 1 - c; pi_hat = viol / n if n else 0
-    if 0 < pi_hat < 1:
-        lr = -2 * (np.log((1-p)**(n-viol) * p**viol)
-                   - np.log((1-pi_hat)**(n-viol) * pi_hat**viol))
-        p_val = 1 - stats.chi2.cdf(lr, df=1)
-    else:
-        lr, p_val = np.nan, np.nan
-    return {"n": n, "violations": viol, "expected": n*p,
-            "rate": pi_hat, "lr": lr, "p_value": p_val}
-
-def component_var_normal(rets_df, w, c=0.95):
-    """Euler decomposition of portfolio VaR under Gaussian assumption.
-    Returns each asset's contribution to portfolio VaR in return units."""
-    cov = rets_df.cov().values
-    w = np.asarray(w, dtype=float)
-    var_p = float(w @ cov @ w)
-    sg = np.sqrt(var_p) if var_p > 0 else 0.0
-    if sg == 0: return np.zeros_like(w)
-    marginal = (cov @ w) / sg
-    return -stats.norm.ppf(1 - c) * (w * marginal)
-
+        v = hist_var(r[i-window:i], c)
+        if not np.isnan(v) and r[i] < -v: breaches += 1
+        n += 1
+    if n == 0 or breaches in (0, n):
+        return (breaches/n if n else np.nan), np.nan, np.nan
+    p_hat, p = breaches/n, 1-c
+    lr = -2*(np.log(((1-p)**(n-breaches))*(p**breaches))
+             - np.log(((1-p_hat)**(n-breaches))*(p_hat**breaches)))
+    return p_hat, float(lr), float(1-stats.chi2.cdf(lr, df=1))
+def component_var_normal(rets_df, weights, c=0.95):
+    rets = rets_df.dropna()
+    if rets.empty: return None
+    cov = rets.cov().values; w = np.asarray(weights, dtype=float); pv = float(w@cov@w)
+    if pv <= 0: return None
+    cvar = w*((cov@w)/np.sqrt(pv))*(-stats.norm.ppf(1-c))
+    denom = np.abs(cvar).sum()
+    pct = cvar/denom*100 if denom>1e-12 else np.zeros_like(cvar)
+    return pd.DataFrame({"Asset":rets.columns,
+                          "Component VaR ($)":cvar,
+                          "% of Portfolio VaR":pct})
 def bootstrap_var_ci(returns, c=0.95, n_boot=1000, seed=42):
-    """Bootstrap 95% CI for the historical VaR statistic."""
-    r = _clean(returns).values
-    if len(r) < 30: return (np.nan, np.nan)
-    rng = np.random.default_rng(seed); boots = []
-    for _ in range(n_boot):
-        sample = rng.choice(r, size=len(r), replace=True)
-        boots.append(-np.quantile(sample, 1 - c))
-    return float(np.percentile(boots, 2.5)), float(np.percentile(boots, 97.5))
-
-# ============================================================
-# Liquidity model — the core of the project
-#   LiquidityCost = lambda * (Position / ADV) * sigma * Position
-#   L-VaR         = Std VaR + Liquidity Cost
-# ============================================================
+    r = _arr(returns)
+    if r.size < 30: return np.nan, np.nan
+    rng = np.random.default_rng(seed)
+    boot = rng.choice(r, size=(n_boot, r.size), replace=True)
+    vars_ = -np.quantile(boot, 1-c, axis=1)
+    return float(np.quantile(vars_, 0.025)), float(np.quantile(vars_, 0.975))
 def liquidity_cost(position_usd, adv_usd, sigma, lam=0.5):
-    if adv_usd is None or adv_usd <= 0 or np.isnan(adv_usd):
-        return float("inf")
-    return lam * (position_usd / adv_usd) * sigma * position_usd
+    if adv_usd is None or adv_usd<=0 or np.isnan(adv_usd) or np.isnan(sigma): return 0.0
+    return float(lam*(position_usd/adv_usd)*sigma*position_usd)
+def portfolio_returns_from(df, holdings):
+    total = sum(holdings.values()) or 1.0
+    weights = {a: v/total for a, v in holdings.items()}
+    pivot = df.pivot_table(index="date", columns="asset", values="return")
+    common = [a for a in weights if a in pivot.columns]
+    if not common: return pd.Series(dtype=float)
+    w = np.array([weights[a] for a in common])
+    return (pivot[common]*w).sum(axis=1).dropna()
+def rolling_metric(returns, window=250, alpha=0.95, kind="var"):
+    fn = hist_var if kind=="var" else expected_shortfall
+    return returns.rolling(window).apply(lambda x: fn(x, alpha), raw=True)
+def money(x):
+    if x is None or (isinstance(x, float) and np.isnan(x)): return "—"
+    a = abs(x)
+    if a >= 1e9: return f"${x/1e9:.2f}B"
+    if a >= 1e6: return f"${x/1e6:.2f}M"
+    if a >= 1e3: return f"${x/1e3:.1f}K"
+    return f"${x:,.0f}"
+def pctf(x, d=2):
+    if x is None or (isinstance(x, float) and np.isnan(x)): return "—"
+    return f"{x*100:.{d}f}%"
 
-# === Sidebar (Module 1) ===
-st.sidebar.markdown("### 📥 Portfolio Input")
-preset = st.sidebar.selectbox("Preset", ["Custom", "Balanced", "BTC-heavy", "Altcoin-heavy"])
-# Institutional-scale defaults so liquidity cost is visible against deep crypto markets
-PRESETS = {
-    "Balanced":      {"BTC-USD": 25_000_000, "ETH-USD": 20_000_000, "SOL-USD": 10_000_000, "BNB-USD": 10_000_000, "XRP-USD": 5_000_000,  "ADA-USD": 5_000_000},
-    "BTC-heavy":     {"BTC-USD": 60_000_000, "ETH-USD": 20_000_000, "SOL-USD": 5_000_000,  "BNB-USD": 5_000_000,  "XRP-USD": 5_000_000,  "ADA-USD": 5_000_000},
-    "Altcoin-heavy": {"BTC-USD": 5_000_000,  "ETH-USD": 10_000_000, "SOL-USD": 25_000_000, "BNB-USD": 15_000_000, "XRP-USD": 20_000_000, "ADA-USD": 25_000_000},
-}
-base = PRESETS.get(preset, {a: 10_000_000.0 for a in DEFAULT_ASSETS})
+# Fix #1: Liq. time human-readable
+def fmt_liq_time(position_usd, adv_usd):
+    if adv_usd <= 0 or np.isnan(adv_usd): return "∞"
+    days = position_usd / (adv_usd * LIQ_PARTICIPATION)
+    secs = days * 86400
+    if secs < 60:   return f"{secs:.0f}s"
+    mins = secs / 60
+    if mins < 60:   return f"{mins:.1f}min"
+    hrs  = mins / 60
+    if hrs  < 24:   return f"{hrs:.2f}h"
+    return f"{days:.3f}d"
 
-positions = {}
-for a in DEFAULT_ASSETS:
-    positions[a] = st.sidebar.number_input(f"{a} (USD)", min_value=0.0,
-                                            value=float(base.get(a, 10_000_000.0)),
-                                            step=500_000.0, format="%.0f")
 
-st.sidebar.markdown("---")
-st.sidebar.markdown("### ⚙️ Risk Parameters")
-conf = st.sidebar.selectbox("Confidence level α", [0.95, 0.99], index=0)
-lam = st.sidebar.slider("λ (market-impact coefficient)", 0.1, 2.0, 0.5, 0.1)
-participation = st.sidebar.slider("Participation rate (% ADV/day)", 0.01, 1.0, 0.20, 0.01)
-window = st.sidebar.selectbox("Rolling vol window (days)", [30, 60, 90], index=0)
-adv_window = st.sidebar.slider("ADV window (days)", 7, 90, 30)
-end_date = st.sidebar.date_input("End date", datetime.utcnow().date())
-start_date = st.sidebar.date_input("Start date", end_date - timedelta(days=365 * 3))
-run_backtest = st.sidebar.checkbox("Run Kupiec POF backtest (slower)", value=True)
-st.sidebar.markdown("---")
-st.sidebar.caption("Université de Genève · MSc Finance · Spring 2026")
-
-# ============================================================
-# Load market data
-# ============================================================
-active = [a for a, v in positions.items() if v > 0]
-if not active:
-    st.warning("Enter at least one positive position in the sidebar to begin.")
-    st.stop()
-
-with st.spinner("Loading market data from Yahoo Finance…"):
-    close, vol_usd = load_data(active, start_date, end_date)
-
-if close.empty:
-    st.error("No data returned. Try a different date range.")
-    st.stop()
-
-# Drop assets that returned no usable data (yfinance can fail per-symbol)
-missing = [a for a in active if a not in close.columns or close[a].notna().sum() < 2]
-if missing:
-    st.warning(f"No data returned for: {', '.join(missing)}. Skipping these assets.")
-active = [a for a in active if a not in missing]
-if not active:
-    st.error("None of the selected assets returned usable data. Try a different date range or fewer assets.")
-    st.stop()
-
-rets = log_returns(close[active])
-total_pos = sum(positions[a] for a in active)
-weights = np.array([positions[a] / total_pos for a in active])
-port_ret = (rets[active] * weights).sum(axis=1)
-
-# === Header banner ===
-st.markdown(f"""<div class="header-banner">
-<h1>📊 Crypto Market & Liquidity Risk Analytics</h1>
-<div class="subtitle">Liquidity-Adjusted Value-at-Risk Dashboard for Institutional Digital-Asset Portfolios</div>
-<div class="meta">Université de Genève · MSc Finance · Global Asset Allocation (Spring 2026) · Liyan Zeng</div>
-</div>""", unsafe_allow_html=True)
-
-# Pre-compute portfolio L-VaR for header KPIs
-total_sv_pre = sum(positions[s] * hist_var(rets[s].dropna(), conf) for s in active)
-total_lc_pre = sum(
-    (lambda pos, adv, sg: lam * (pos/adv) * sg * pos if adv and adv > 0 else 0)(
-        positions[s],
-        float(vol_usd[s].dropna().tail(adv_window).mean()) if s in vol_usd.columns else 0,
-        ann_vol(rets[s].dropna())
-    )
-    for s in active
+# ──────────────── Streamlit App ────────────────
+st.set_page_config(
+    page_title="Crypto Risk Dashboard — UNIGE",
+    page_icon="📊",
+    layout="wide",
+    initial_sidebar_state="expanded",
 )
 
+# Custom CSS
+st.markdown("""
+<style>
+[data-testid="stMetricValue"] { font-size: 1.4rem; font-weight: 700; }
+.block-container { padding-top: 1rem; }
+</style>
+""", unsafe_allow_html=True)
+
+# Header
+st.markdown(f"""
+<div style="background:{BRAND};padding:16px 24px;border-radius:8px;margin-bottom:16px">
+  <div style="color:#bbd;font-size:0.8rem">
+    Université de Genève · Geneva School of Economics and Management
+  </div>
+  <div style="color:white;font-size:1.6rem;font-weight:700;margin:4px 0">
+    Crypto Market &amp; Liquidity Risk Dashboard
+  </div>
+  <div style="color:#dde6f5;font-size:0.9rem">
+    Quantitative Risk Management (Spring 26) · <b>Group 3</b>
+  </div>
+</div>
+""", unsafe_allow_html=True)
+
+# Load data
+END   = pd.Timestamp.today().normalize()
+START = END - pd.Timedelta(days=365*3)
+FEATURES, MISSING = load_features(
+    tuple(DEFAULT_TICKERS),
+    START.strftime("%Y-%m-%d"),
+    END.strftime("%Y-%m-%d")
+)
+if FEATURES is None:
+    st.error("All data downloads failed. Check internet connection.")
+    st.stop()
+
+ASSETS = sorted(FEATURES["asset"].unique().tolist())
+
+# ──────────────── Sidebar Controls ────────────────
+with st.sidebar:
+    st.markdown(f"### 📦 Portfolio holdings (USD)")
+    st.caption("Edit any value — all charts re-compute live.")
+    holdings = {}
+    for a in ASSETS:
+        holdings[a] = st.number_input(
+            a, min_value=0, step=10_000,
+            value=int(DEFAULT_POSITIONS.get(a, 0)),
+            key=f"hold_{a}"
+        )
+    st.divider()
+    alpha = st.slider("VaR / ES confidence (α)",
+                      min_value=0.90, max_value=0.99,
+                      value=0.95, step=0.01,
+                      format="%.2f")
+    lam = st.slider("Liquidity coefficient (λ)",
+                    min_value=0.0, max_value=2.0,
+                    value=0.5, step=0.05,
+                    format="%.2f")
+    scenario = st.selectbox("Stress scenario", list(SCENARIOS.keys()))
+    st.divider()
+    AUM = sum(holdings.values()) or 1.0
+    port_ret = portfolio_returns_from(FEATURES, holdings).dropna()
+    last_r = port_ret.iloc[-1] if not port_ret.empty else np.nan
+    regime_label, regime_color = classify_regime(last_r)
+    st.markdown(f"**AUM:** {money(AUM)}")
+    st.markdown(f"**α:** {int(alpha*100)}%")
+    st.markdown(f"**λ:** {lam:.2f}")
+    st.markdown(
+        f"**Regime:** <span style='color:{regime_color};font-weight:700'>{regime_label}</span>",
+        unsafe_allow_html=True
+    )
+    st.markdown(f"**Scenario:** {scenario}")
+
+# ──────────────── KPI Row ────────────────
+std_var_pct = hist_var(port_ret, alpha) if not port_ret.empty else np.nan
+std_var_usd = std_var_pct * AUM if not np.isnan(std_var_pct) else np.nan
+latest = FEATURES.sort_values("date").groupby("asset").tail(1).set_index("asset")
+lc_total = sum(
+    liquidity_cost(
+        holdings.get(a,0),
+        float(latest.loc[a,"adv_30_usd"]) if a in latest.index else 0,
+        FEATURES[FEATURES["asset"]==a]["return"].std(ddof=1), lam
+    ) for a in ASSETS if a in latest.index
+)
+lvar = (std_var_usd + lc_total) if not np.isnan(std_var_usd) else np.nan
+a_vol = ann_vol(port_ret) if not port_ret.empty else np.nan
+
 k1, k2, k3, k4, k5 = st.columns(5)
-k1.metric("Portfolio AUM", f"${total_pos/1e6:,.1f}M")
-k2.metric(f"Std VaR ({int(conf*100)}%)", f"${total_sv_pre/1e6:,.2f}M")
-k3.metric("Liquidity Cost", f"${total_lc_pre/1e6:,.2f}M",
-          delta=f"+{total_lc_pre/total_sv_pre*100:.0f}%" if total_sv_pre else None)
-k4.metric("Liquidity-Adjusted VaR", f"${(total_sv_pre+total_lc_pre)/1e6:,.2f}M")
-k5.metric("Annualized Vol", f"{ann_vol(port_ret)*100:.1f}%")
+k1.metric("Portfolio AUM",          money(AUM),          f"{len(ASSETS)} assets")
+k2.metric(f"Std VaR {int(alpha*100)}%", money(std_var_usd),  pctf(std_var_pct))
+k3.metric(f"Liq. cost (λ={lam:.2f})",  money(lc_total),     f"{lc_total/AUM*100:.4f}% AUM")
+k4.metric(f"L-VaR {int(alpha*100)}%",   money(lvar),         pctf(lvar/AUM) if not np.isnan(lvar) else "—")
+k5.metric("Ann. vol (√365)",          pctf(a_vol,1),       "Crypto 365d/yr")
 
-st.caption(":blue[**👈 Adjust positions and risk parameters in the sidebar (Module 1).**] All analytical modules below recompute live.")
+st.divider()
 
-tabs = st.tabs([
-    "📈 Market Data",
+# ──────────────── Tabs ────────────────
+tab_market, tab_var, tab_liq, tab_scen, tab_meth = st.tabs([
+    "📊 Market Data",
     "📉 VaR & ES",
-    "🧮 Component & Diversification",
-    "💧 Liquidity Risk",
-    "💥 Crash Scenarios",
-    "ℹ️ Methodology & References",
+    "💧 Liquidity",
+    "🌪 Crash Scenarios",
+    "📚 Methodology",
 ])
 
-# === Tab 1 — Market Data ===
-with tabs[0]:
-    st.subheader("Market Data Dashboard")
 
-    norm = close[active] / close[active].iloc[0] * 100
-    st.plotly_chart(px.line(norm, title="Normalized Prices (Base = 100)"),
-                    use_container_width=True)
+# ──────────── TAB 1: Market Data ────────────
+with tab_market:
+    df = FEATURES.copy()
+    vol_30 = port_ret.tail(30).std(ddof=1)*np.sqrt(TRADING_DAYS) if len(port_ret)>=30 else np.nan
+    ret_7d = (1+port_ret.tail(7)).prod()-1 if len(port_ret)>=7 else np.nan
+    avg_p  = df.pivot_table(index="date",columns="asset",values="close").mean(axis=1).dropna()
+    mdd    = max_drawdown(avg_p)
+    senti  = ("Risk-off" if not pd.isna(ret_7d) and ret_7d<-0.10
+              else "Risk-on" if not pd.isna(ret_7d) and ret_7d>0.10
+              else "Neutral" if not pd.isna(ret_7d) else "N/A")
 
-    fig_p = px.line(close[active], title="Raw Price Trends (log scale)")
-    fig_p.update_yaxes(type="log")
-    st.plotly_chart(fig_p, use_container_width=True)
-
-    rv = rets[active].rolling(window).std() * np.sqrt(TRADING_DAYS)
-    st.plotly_chart(px.line(rv, title=f"{window}-Day Rolling Annualized Volatility"),
-                    use_container_width=True)
-
-    nav = (1 + rets[active]).cumprod()
-    dd = nav / nav.cummax() - 1
-    st.plotly_chart(px.area(dd, title="Drawdown by Asset"), use_container_width=True)
-
-    # NEW: Cross-asset correlation heatmap
-    st.markdown("#### Cross-Asset Return Correlation")
-    corr = rets[active].corr()
-    fig_c = px.imshow(corr, text_auto=".2f", aspect="auto",
-                      color_continuous_scale="RdBu_r", zmin=-1, zmax=1,
-                      title="Pearson Correlation of Daily Log Returns")
-    st.plotly_chart(fig_c, use_container_width=True)
-    st.caption("High pairwise correlations (typically 0.7–0.9 across crypto majors) imply limited "
-               "diversification benefit and dominant common-factor exposure — a defining feature of the "
-               "asset class compared to traditional multi-asset portfolios.")
-
-# === Tab 2 — VaR & ES (3 methods + Kupiec backtest) ===
-with tabs[1]:
-    st.subheader("Value-at-Risk & Expected Shortfall")
-    st.markdown("Three estimators are compared and validated with the **Kupiec (1995) Proportion-of-Failures backtest**.")
-
-    rows = []
-    for s in active:
-        r = rets[s].dropna()
-        rows.append({
-            "Asset": s,
-            "Position": positions[s],
-            "Weight": positions[s] / total_pos,
-            "Ann Vol": ann_vol(r),
-            "Skew": float(stats.skew(r)),
-            "Excess Kurt": float(stats.kurtosis(r)),
-            "Hist VaR": hist_var(r, conf),
-            "Param VaR": parametric_var(r, conf),
-            "CF VaR": cornish_fisher_var(r, conf),
-            "ES": expected_shortfall(r, conf),
-            "Max DD": max_drawdown(close[s].dropna()),
-        })
-    df_v = pd.DataFrame(rows)
-    st.dataframe(df_v.style.format({
-        "Position":"${:,.0f}", "Weight":"{:.1%}", "Ann Vol":"{:.2%}",
-        "Skew":"{:+.2f}", "Excess Kurt":"{:+.2f}",
-        "Hist VaR":"{:.2%}","Param VaR":"{:.2%}","CF VaR":"{:.2%}",
-        "ES":"{:.2%}","Max DD":"{:.2%}",
-    }), use_container_width=True, hide_index=True)
-    st.download_button("📥 Download asset-level VaR table (CSV)",
-                       df_v.to_csv(index=False).encode(),
-                       "asset_var.csv", "text/csv")
-
-    # Portfolio return distribution + all VaR lines
-    st.markdown("#### Portfolio Daily Return Distribution")
-    hv = hist_var(port_ret, conf)
-    pv = parametric_var(port_ret, conf)
-    cf = cornish_fisher_var(port_ret, conf)
-    es_p = expected_shortfall(port_ret, conf)
-    boot_lo, boot_hi = bootstrap_var_ci(port_ret, conf)
-    fig = go.Figure()
-    fig.add_trace(go.Histogram(x=port_ret, nbinsx=80, name="Returns", marker_color="#94a3b8"))
-    for label, val, color in [("Hist VaR", -hv, "#f97316"),
-                              ("Param VaR", -pv, "#3b82f6"),
-                              ("CF VaR", -cf, "#dc2626"),
-                              ("ES", -es_p, "#7c3aed")]:
-        fig.add_vline(x=val, line_color=color, line_width=2,
-                      annotation_text=label, annotation_position="top")
-    fig.update_layout(showlegend=False, height=380)
-    st.plotly_chart(fig, use_container_width=True)
-
-    cA, cB, cC, cD = st.columns(4)
-    cA.metric("Historical VaR", f"{hv*100:.2f}%")
-    cB.metric("Parametric VaR", f"{pv*100:.2f}%")
-    cC.metric("Cornish-Fisher VaR", f"{cf*100:.2f}%")
-    cD.metric("Expected Shortfall", f"{es_p*100:.2f}%")
-    if not np.isnan(boot_lo):
-        st.caption(f"**Bootstrap 95% CI for Historical VaR**: [{boot_lo*100:.2f}%, {boot_hi*100:.2f}%]  "
-                   f"— sampling uncertainty from 1,000 resamples of {len(port_ret)} daily returns.")
-
-    # Kupiec POF backtest
-    if run_backtest:
-        st.markdown("#### Kupiec (1995) Proportion-of-Failures Backtest")
-        st.caption("250-day rolling-window backtest. H₀: empirical violation rate equals (1 − α). "
-                   "p-value > 5% means we cannot reject H₀ — the model is statistically valid.")
-        bt_rows = []
-        with st.spinner("Running rolling-window backtests…"):
-            for name, fn in [("Historical", hist_var),
-                             ("Parametric (Normal)", parametric_var),
-                             ("Cornish-Fisher", cornish_fisher_var)]:
-                res = kupiec_pof(port_ret, fn, conf, 250)
-                if res:
-                    pass_ = res["p_value"] > 0.05 if not np.isnan(res["p_value"]) else False
-                    bt_rows.append({
-                        "Method": name,
-                        "N (test)": res["n"],
-                        "Violations": res["violations"],
-                        "Expected": f"{res['expected']:.1f}",
-                        "Empirical Rate": f"{res['rate']*100:.2f}%",
-                        "Expected Rate": f"{(1-conf)*100:.2f}%",
-                        "LR stat": f"{res['lr']:.3f}" if not np.isnan(res["lr"]) else "n/a",
-                        "p-value": f"{res['p_value']:.3f}" if not np.isnan(res["p_value"]) else "n/a",
-                        "Verdict": "✅ Pass" if pass_ else "❌ Reject",
-                    })
-        if bt_rows:
-            st.dataframe(pd.DataFrame(bt_rows), use_container_width=True, hide_index=True)
-            st.caption("Under Basel III's traffic-light framework, fewer-than-expected violations are conservative; "
-                       "more-than-expected violations indicate the model under-estimates tail risk.")
-
-# === Tab 3 — Component VaR & Diversification ===
-with tabs[2]:
-    st.subheader("Component VaR & Diversification Analysis")
-    st.markdown(r"""
-**Euler decomposition** of portfolio VaR under the Gaussian assumption:
-$$
-\text{VaR}_p = \sum_i w_i \cdot \frac{\partial \text{VaR}_p}{\partial w_i}, \qquad
-\text{Component VaR}_i = w_i \cdot \frac{(\Sigma w)_i}{\sigma_p} \cdot z_{1-\alpha}
-$$
-This answers **which assets actually drive portfolio risk** — often very different from their capital weights.
-""")
-    contrib = component_var_normal(rets[active], weights, conf)
-    contrib_dollar = contrib * total_pos
-    standalone_dollar = np.array([positions[s] * hist_var(rets[s].dropna(), conf) for s in active])
-    risk_share = (contrib / contrib.sum() * 100) if contrib.sum() else np.zeros_like(contrib)
-    df_c = pd.DataFrame({
-        "Asset": active,
-        "Weight (%)": weights * 100,
-        "Standalone VaR ($)": standalone_dollar,
-        "Component VaR ($)": contrib_dollar,
-        "Risk Share (%)": risk_share,
-    })
-    st.dataframe(df_c.style.format({
-        "Weight (%)": "{:.1f}%", "Standalone VaR ($)": "${:,.0f}",
-        "Component VaR ($)": "${:,.0f}", "Risk Share (%)": "{:.1f}%",
-    }), use_container_width=True, hide_index=True)
-
-    c1, c2 = st.columns(2)
-    with c1:
-        fig = go.Figure(go.Bar(x=df_c["Asset"], y=df_c["Weight (%)"], marker_color="#3b82f6"))
-        fig.update_layout(title="Capital Allocation (Weight %)", yaxis_title="%", height=340)
-        st.plotly_chart(fig, use_container_width=True)
-    with c2:
-        fig = go.Figure(go.Bar(x=df_c["Asset"], y=df_c["Risk Share (%)"], marker_color="#dc2626"))
-        fig.update_layout(title="Risk Allocation (Component VaR %)", yaxis_title="%", height=340)
-        st.plotly_chart(fig, use_container_width=True)
-
-    sum_standalone = float(standalone_dollar.sum())
-    portfolio_var_usd = total_pos * hist_var(port_ret, conf)
-    div_benefit = (sum_standalone - portfolio_var_usd) / sum_standalone if sum_standalone else 0
-    m1, m2, m3 = st.columns(3)
-    m1.metric("Σ Standalone VaR", f"${sum_standalone/1e6:,.2f}M")
-    m2.metric("Portfolio VaR", f"${portfolio_var_usd/1e6:,.2f}M")
-    m3.metric("Diversification Benefit", f"{div_benefit*100:.1f}%")
-    st.caption("Diversification benefit = 1 − Portfolio VaR ÷ Σ Standalone VaR. Crypto's high pairwise correlations "
-               "keep this typically modest (10–25%) — many assets ≠ diversified portfolio.")
-
-# === Tab 4 — Liquidity Risk ===
-with tabs[3]:
-    st.subheader("💧 Liquidity Risk — Liquidity-Adjusted VaR")
-    st.markdown(r"""
-**Liquidity-cost model** (the soul of this project):
-$$
-\text{Liquidity Cost} = \lambda \times \frac{\text{Position}}{\text{ADV}} \times \sigma \times \text{Position}
-$$
-$$
-\text{L-VaR} = \text{Std VaR} + \text{Liquidity Cost}
-$$
-Two assets with similar volatility can have very different total risk if one is hard to liquidate.
-    """)
-
-    rows = []
-    total_sv = 0.0; total_lc = 0.0
-    for s in active:
-        r = rets[s].dropna()
-        adv_s = float(vol_usd[s].dropna().tail(adv_window).mean())
-        sigma = ann_vol(r)
-        pos = positions[s]
-        sv_usd = pos * hist_var(r, conf)
-        lc = liquidity_cost(pos, adv_s, sigma, lam)
-        rows.append({
-            "Asset": s,
-            "Position": pos,
-            "ADV (USD)": adv_s,
-            "Liq Ratio": (pos / adv_s) if adv_s else np.nan,
-            "Days to Liquidate": (pos / (participation * adv_s)) if adv_s else np.nan,
-            "Std VaR ($)": sv_usd,
-            "Liquidity Cost ($)": lc,
-            "L-VaR ($)": sv_usd + lc,
-            "L-VaR / Std VaR": (sv_usd + lc) / sv_usd if sv_usd else np.nan,
-        })
-        total_sv += sv_usd; total_lc += lc
-    df_liq = pd.DataFrame(rows)
-
-    a, b, c = st.columns(3)
-    a.metric("Standard VaR", f"${total_sv:,.0f}")
-    delta_pct = f"+{total_lc/total_sv*100:.1f}%" if total_sv else None
-    b.metric("Liquidity Cost (extra loss)", f"${total_lc:,.0f}", delta=delta_pct)
-    c.metric("Liquidity-Adjusted VaR", f"${total_sv + total_lc:,.0f}")
-
-    st.dataframe(
-        df_liq.style.format({
-            "Position": "${:,.0f}", "ADV (USD)": "${:,.0f}",
-            "Liq Ratio": "{:.4f}", "Days to Liquidate": "{:.2f}",
-            "Std VaR ($)": "${:,.0f}", "Liquidity Cost ($)": "${:,.0f}",
-            "L-VaR ($)": "${:,.0f}", "L-VaR / Std VaR": "{:.2f}x",
-        }),
-        use_container_width=True, hide_index=True,
+    # Regime legend (Fix #2)
+    st.info(
+        "🟤 **Crisis** <−5% │ "
+        "🔴 **High Risk** <−3% │ "
+        "🟠 **Elevated** <−1.5% │ "
+        "🟡 **Moderate** −1.5% to 0% │ "
+        "🟢 **Stable** 0% to +1.5% │ "
+        "🔵 **Bull** >+1.5%"
     )
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("Risk regime",  regime_label, "1-day signal")
+    m2.metric("Vol (30d)",    pctf(vol_30,1), "Annualised (√365)")
+    m3.metric("7-day return", pctf(ret_7d,2), "Trailing")
+    m4.metric("Max drawdown", pctf(mdd,1),    "Equal-weight")
+    m5.metric("Sentiment",    senti,          "7d return")
 
-    fig = go.Figure()
-    fig.add_trace(go.Bar(x=df_liq["Asset"], y=df_liq["Std VaR ($)"], name="Std VaR"))
-    fig.add_trace(go.Bar(x=df_liq["Asset"], y=df_liq["Liquidity Cost ($)"], name="Liquidity Cost"))
-    fig.update_layout(barmode="stack", title="Std VaR vs Liquidity Cost (stacked, by asset)")
-    st.plotly_chart(fig, use_container_width=True)
+    col1, col2 = st.columns(2)
+    with col1:
+        fig = px.line(df, x="date", y="norm_price", color="asset",
+                      title="Normalised price (start=1.0)", height=320)
+        fig.update_layout(template="plotly_white", legend_title="")
+        st.plotly_chart(fig, use_container_width=True)
+    with col2:
+        fig = px.line(df, x="date", y="rolling_vol_30", color="asset",
+                      title="30d rolling volatility (ann. √365)", height=320)
+        fig.update_layout(template="plotly_white", yaxis_tickformat=".0%", legend_title="")
+        st.plotly_chart(fig, use_container_width=True)
+    col3, col4 = st.columns(2)
+    with col3:
+        fig = px.line(df, x="date", y="drawdown", color="asset",
+                      title="Drawdown from peak", height=320)
+        fig.update_layout(template="plotly_white", yaxis_tickformat=".0%", legend_title="")
+        st.plotly_chart(fig, use_container_width=True)
+    with col4:
+        corr = df.pivot_table(index="date",columns="asset",values="return").corr().round(2)
+        fig = go.Figure(go.Heatmap(
+            z=corr.values, x=corr.columns.tolist(), y=corr.index.tolist(),
+            colorscale="RdBu_r", zmin=-1, zmax=1,
+            text=corr.values, texttemplate="%{text:.2f}"))
+        fig.update_layout(title="Return correlation matrix",
+                          template="plotly_white", height=320)
+        st.plotly_chart(fig, use_container_width=True)
 
-    # λ sensitivity
-    lams = np.linspace(0.1, 2.0, 25)
-    lvars = []
-    advs = {s: float(vol_usd[s].dropna().tail(adv_window).mean()) for s in active}
-    sigmas = {s: ann_vol(rets[s].dropna()) for s in active}
-    for l in lams:
-        tlc = sum(liquidity_cost(positions[s], advs[s], sigmas[s], l) for s in active)
-        lvars.append(total_sv + tlc)
-    fig_l = px.line(x=lams, y=lvars,
-                    labels={"x": "λ", "y": "Portfolio L-VaR ($)"},
-                    title="λ Sensitivity — Portfolio L-VaR vs Market-Impact Coefficient")
-    st.plotly_chart(fig_l, use_container_width=True)
 
-    # Auto-insight
-    if total_sv > 0 and df_liq["Days to Liquidate"].notna().any():
-        worst = df_liq.loc[df_liq["Days to Liquidate"].idxmax()]
-        st.info(
-            f"💡 At a {participation*100:.0f}% participation rate, **{worst['Asset']}** would take "
-            f"**{worst['Days to Liquidate']:.1f} days** to liquidate. "
-            f"Liquidity adds **{total_lc/total_sv*100:.1f}%** on top of standard VaR for this portfolio."
-        )
-
-# === Tab 5 — Crash Scenarios ===
-with tabs[4]:
-    st.subheader("💥 Crash Scenario Stress Testing")
-    st.markdown("Each scenario applies a **price shock** (mark-to-market loss) plus a **liquidity stress** "
-                "(reduced ADV, amplified λ). Total stressed loss = |MTM P&L| + Stressed Liquidity Cost.")
-    SCENARIOS = {
-        "Crypto Winter":        {"BTC-USD": -0.50, "ETH-USD": -0.60, "_alt": -0.75, "adv": 0.40, "lam": 1.5,
-                                  "desc": "Multi-month structural bear market (cf. 2018, 2022). Sentiment collapse compounded by macro tightening."},
-        "Exchange Collapse":    {"BTC-USD": -0.25, "ETH-USD": -0.30, "_alt": -0.50, "adv": 0.20, "lam": 3.0,
-                                  "desc": "Major venue insolvency (cf. FTX, November 2022). Severe liquidity withdrawal and custody freeze."},
-        "Stablecoin Panic":     {"BTC-USD": -0.15, "ETH-USD": -0.20, "_alt": -0.35, "adv": 0.50, "lam": 2.0,
-                                  "desc": "USDT/USDC depeg episode (cf. UST/Luna, May 2022). Cross-asset basis blowup."},
-        "Regulatory Crackdown": {"BTC-USD": -0.20, "ETH-USD": -0.25, "_alt": -0.40, "adv": 0.60, "lam": 1.8,
-                                  "desc": "Coordinated G7 enforcement action (cf. PRC ban, 2021). Forced exchange off-boarding."},
-    }
-    sc_name = st.selectbox("Scenario", list(SCENARIOS.keys()) + ["Custom"])
-    if sc_name != "Custom":
-        st.info(f"**{sc_name}** — {SCENARIOS[sc_name]['desc']}")
-    if sc_name == "Custom":
-        st.markdown("**Custom shocks (per asset, % return)**")
-        cols = st.columns(len(active))
-        shocks = {}
-        for i, s in enumerate(active):
-            shocks[s] = cols[i].slider(s, -0.95, 0.50, -0.30, 0.05)
-        adv_mult = st.slider("ADV multiplier (lower = thinner market)", 0.05, 1.0, 0.50)
-        lam_mult = st.slider("λ multiplier (higher = more market impact)", 1.0, 5.0, 2.0)
+# ──────────── TAB 2: VaR & ES ────────────
+with tab_var:
+    if port_ret.empty:
+        st.warning("No return data.")
     else:
-        sc = SCENARIOS[sc_name]
-        shocks = {s: sc.get(s, sc["_alt"]) for s in active}
-        adv_mult = sc["adv"]; lam_mult = sc["lam"]
+        methods = {
+            "Historical Simulation": hist_var(port_ret, alpha),
+            "Parametric (Normal)":   parametric_var(port_ret, alpha),
+            "Cornish-Fisher":        cornish_fisher_var(port_ret, alpha),
+        }
+        es     = expected_shortfall(port_ret, alpha)
+        ci_lo, ci_hi = bootstrap_var_ci(port_ret.values, alpha)
+        phat, lr_, pval = kupiec_pof(port_ret.values, alpha)
+        ci_str = (f"[{ci_lo*100:.2f}%, {ci_hi*100:.2f}%]"
+                  if not np.isnan(ci_lo) else "—")
+        rows = []
+        for name, v in methods.items():
+            rows.append({
+                "Method": name,
+                f"VaR {int(alpha*100)}% (%)": f"{v*100:.2f}" if not np.isnan(v) else "—",
+                f"VaR {int(alpha*100)}% ($)": money(v*AUM)   if not np.isnan(v) else "—",
+                "Bootstrap 95% CI": ci_str,
+            })
+        rows.append({
+            "Method": f"ES {int(alpha*100)}%",
+            f"VaR {int(alpha*100)}% (%)": f"{es*100:.2f}" if not np.isnan(es) else "—",
+            f"VaR {int(alpha*100)}% ($)": money(es*AUM)    if not np.isnan(es) else "—",
+            "Bootstrap 95% CI": ci_str,
+        })
 
-    # Total scenario loss = |MTM loss from price shock| + Stressed Liquidity Cost
-    rows = []; sc_pnl = 0.0; sc_lc = 0.0
-    for s in active:
-        pos = positions[s]
-        r = rets[s].dropna()
-        adv_stressed = float(vol_usd[s].dropna().tail(adv_window).mean()) * adv_mult
-        sigma = ann_vol(r)
-        lc = liquidity_cost(pos, adv_stressed, sigma, lam * lam_mult)
-        pnl = pos * shocks[s]
-        sc_pnl += pnl; sc_lc += lc
-        rows.append({"Asset": s, "Shock": shocks[s], "MTM P&L": pnl,
-                     "Liq Cost (stressed)": lc,
-                     "Total Loss": abs(pnl) + lc})
+        c1, c2 = st.columns(2)
+        with c1:
+            st.subheader(f"VaR comparison @ {int(alpha*100)}%")
+            st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+        with c2:
+            fig = go.Figure()
+            fig.add_trace(go.Histogram(x=port_ret*100, nbinsx=60, marker_color="#9aa9c2"))
+            v0 = methods["Historical Simulation"]
+            if not np.isnan(v0):
+                fig.add_vline(x=-v0*100, line_color="red", line_dash="dash",
+                              annotation_text=f"VaR {int(alpha*100)}%")
+            if not np.isnan(es):
+                fig.add_vline(x=-es*100, line_color="darkred", line_dash="dot",
+                              annotation_text=f"ES {int(alpha*100)}%")
+            fig.update_layout(title="Return distribution", template="plotly_white",
+                              height=320, xaxis_title="Daily return (%)", showlegend=False)
+            st.plotly_chart(fig, use_container_width=True)
 
-    realized_loss = abs(sc_pnl)
-    total_stressed_loss = realized_loss + sc_lc
-    base_lvar = total_sv + total_lc
+        st.subheader("Kupiec POF backtest")
+        kp = []
+        if not (phat is None or (isinstance(phat,float) and np.isnan(phat))):
+            kp.append(f"Breach rate: {phat*100:.2f}% (target {(1-alpha)*100:.0f}%)")
+        if pval is not None and not np.isnan(pval):
+            kp.append(f"p-value: {pval:.3f} → "
+                      f"{'adequate ✓' if pval>0.05 else 'under-estimates risk ✗'}")
+        if not kp:
+            kp = ["Need > 255 days for Kupiec backtest"]
+        for item in kp:
+            st.write(f"• {item}")
 
-    a, b, c, d = st.columns(4)
-    a.metric("Scenario P&L (MTM)", f"${sc_pnl:,.0f}")
-    b.metric("Realized Loss", f"${realized_loss:,.0f}")
-    c.metric("Liquidity Cost (stressed)", f"${sc_lc:,.0f}")
-    delta_txt = f"{(total_stressed_loss/base_lvar - 1)*100:+.0f}% vs baseline L-VaR" if base_lvar else None
-    d.metric("Total Stressed Loss", f"${total_stressed_loss:,.0f}", delta=delta_txt)
+        st.subheader(f"Per-asset @ α={int(alpha*100)}%")
+        per = []
+        for a in ASSETS:
+            sub = FEATURES[FEATURES["asset"]==a].sort_values("date")
+            r   = sub["return"].dropna()
+            if r.empty: continue
+            per.append({"Asset":a,
+                        "Last price": f"${sub['close'].iloc[-1]:,.2f}",
+                        f"VaR {int(alpha*100)}% (%)": f"{hist_var(r,alpha)*100:.2f}",
+                        f"ES {int(alpha*100)}% (%)": f"{expected_shortfall(r,alpha)*100:.2f}",
+                        "Max DD":   f"{max_drawdown(sub['close'])*100:.1f}%",
+                        "Ann. vol (√365)": f"{ann_vol(r)*100:.0f}%"})
+        st.dataframe(pd.DataFrame(per), hide_index=True, use_container_width=True)
 
-    df_sc = pd.DataFrame(rows)
-    st.dataframe(df_sc.style.format({
-        "Shock": "{:.0%}", "MTM P&L": "${:,.0f}",
-        "Liq Cost (stressed)": "${:,.0f}", "Total Loss": "${:,.0f}",
-    }), use_container_width=True, hide_index=True)
+        c3, c4 = st.columns(2)
+        with c3:
+            pivot = FEATURES.pivot_table(index="date",columns="asset",values="return").dropna()
+            w = np.array([holdings.get(a,0)/AUM for a in pivot.columns])
+            cvar_df = component_var_normal(pivot, w, alpha)
+            if cvar_df is not None:
+                fig = px.bar(cvar_df, x="Asset", y="% of Portfolio VaR", color="Asset",
+                             title="Component VaR (Euler decomposition)")
+                fig.update_layout(template="plotly_white", height=320, showlegend=False)
+                st.plotly_chart(fig, use_container_width=True)
+        with c4:
+            rv  = rolling_metric(port_ret, 250, alpha, "var")*100
+            re_ = rolling_metric(port_ret, 250, alpha, "es")*100
+            roll_df = pd.DataFrame({"date":rv.index,"Rolling VaR":rv.values,
+                                     "Rolling ES":re_.values}).dropna()
+            if roll_df.empty:
+                st.info("Rolling VaR & ES: need 250+ days")
+            else:
+                fig = px.line(roll_df, x="date", y=["Rolling VaR","Rolling ES"],
+                              title=f"Rolling VaR & ES (250d, {int(alpha*100)}%)")
+                fig.update_layout(template="plotly_white", height=320,
+                                  yaxis_title="Loss (%)", legend_title="")
+                st.plotly_chart(fig, use_container_width=True)
 
-    fig = go.Figure(go.Waterfall(
-        x=["Baseline L-VaR", "+ MTM shock loss", "+ Extra liquidity stress", "Total Stressed Loss"],
-        y=[base_lvar, realized_loss - total_sv, sc_lc - total_lc, total_stressed_loss],
-        measure=["absolute", "relative", "relative", "total"],
-    ))
-    fig.update_layout(title=f"Scenario Waterfall — Baseline → {sc_name}")
+
+# ──────────── TAB 3: Liquidity ────────────
+with tab_liq:
+    st.info(
+        "**Liquidity Cost:** LC = λ · (Position/ADV) · σ · Position  "
+        "[Kyle/Almgren-Chriss adapted; λ = price-impact coeff.; ADV = 30d avg. daily volume]  "
+        "\n**L-VaR** = Std VaR + LC  │  "
+        "**Liq. time** = time to liquidate at 25% daily volume participation"
+    )
+    rows_liq = []; total_lc = 0.0
+    for a in ASSETS:
+        if a not in latest.index: continue
+        h     = float(holdings.get(a, 0))
+        adv   = float(latest.loc[a,"adv_30_usd"])
+        sd    = FEATURES[FEATURES["asset"]==a]["return"].std(ddof=1)
+        var_a = hist_var(FEATURES[FEATURES["asset"]==a]["return"], alpha)
+        lc    = liquidity_cost(h, adv, sd, lam); total_lc += lc
+        lavar = (var_a*h+lc) if not np.isnan(var_a) else np.nan
+        rows_liq.append({
+            "Asset":         a,
+            "Position":      money(h),
+            "30-day ADV":    money(adv),
+            "Position/ADV":  f"{(h/adv*100 if adv>0 else 0):.4f}%",
+            "Liq. time":     fmt_liq_time(h, adv),   # Fix #1
+            "σ (daily)":     f"{sd*100:.2f}%",
+            "Liq. cost":     money(lc),
+            "Std VaR ($)":   money(var_a*h) if not np.isnan(var_a) else "—",
+            "L-VaR ($)":     money(lavar)   if not np.isnan(lavar)  else "—",
+        })
+
+    st.subheader(f"Per-asset liquidity (λ={lam:.2f}, α={int(alpha*100)}%)")
+    st.dataframe(pd.DataFrame(rows_liq), hide_index=True, use_container_width=True)
+    st.markdown(f"**Total LC:** {money(total_lc)} &nbsp;&nbsp; "
+                f"**Std VaR:** {money(std_var_usd)} &nbsp;&nbsp; "
+                f"**L-VaR:** {money((std_var_usd or 0)+total_lc)}")
+
+    # Lambda sensitivity
+    lam_grid = np.linspace(0.0, 2.0, 21); sens = []
+    for L in lam_grid:
+        tot = sum(liquidity_cost(
+                    float(holdings.get(a,0)),
+                    float(latest.loc[a,"adv_30_usd"]) if a in latest.index else 0,
+                    FEATURES[FEATURES["asset"]==a]["return"].std(ddof=1), L)
+                  for a in ASSETS if a in latest.index)
+        sens.append({"lambda":L, "Liquidity cost":tot,
+                     "L-VaR":(std_var_usd or 0)+tot})
+    sens_df = pd.DataFrame(sens)
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=sens_df["lambda"], y=sens_df["Liquidity cost"],
+                              name="Liquidity cost", mode="lines+markers"))
+    fig.add_trace(go.Scatter(x=sens_df["lambda"], y=sens_df["L-VaR"],
+                              name="L-VaR", mode="lines+markers"))
+    if std_var_usd and not np.isnan(std_var_usd):
+        fig.add_hline(y=std_var_usd, line_dash="dash", line_color="gray",
+                      annotation_text=f"Std VaR={money(std_var_usd)}")
+    fig.add_vline(x=lam, line_color="black", line_dash="dot",
+                  annotation_text=f"λ={lam:.2f}")
+    fig.update_layout(title="L-VaR vs λ (price-impact sensitivity)",
+                      template="plotly_white", height=380,
+                      xaxis_title="λ", yaxis_title="USD")
+    st.subheader("λ sensitivity")
     st.plotly_chart(fig, use_container_width=True)
 
-    st.caption(
-        f"Under **{sc_name}**: ${realized_loss:,.0f} mark-to-market loss from the price shock "
-        f"+ ${sc_lc:,.0f} extra to liquidate in a thinner market "
-        f"(ADV × {adv_mult:.0%}, λ × {lam_mult:.1f}) = **${total_stressed_loss:,.0f} total**."
-    )
 
-# === Tab 6 — Methodology & References ===
-with tabs[5]:
-    st.subheader("Methodology & Academic References")
-    st.markdown(r"""
-### 1. Returns
-Daily continuously-compounded log returns from Yahoo Finance close prices: $r_t = \ln(P_t / P_{t-1})$. Crypto markets trade 24/7, so we annualize volatility with $\sqrt{365}$ rather than $\sqrt{252}$.
+# ──────────── TAB 4: Crash Scenarios ────────────
+with tab_scen:
+    sc = SCENARIOS[scenario]
+    st.warning(f"**{scenario}** — {sc['description']}")
+    rows_sc = []; total_mtm = 0.0; total_stress_lc = 0.0
+    for a in ASSETS:
+        if a not in latest.index: continue
+        h     = float(holdings.get(a, 0))
+        shock = sc["shocks"].get(a, -0.30)
+        adv   = float(latest.loc[a,"adv_30_usd"])
+        sd    = FEATURES[FEATURES["asset"]==a]["return"].std(ddof=1)
+        mtm   = h*shock
+        slc   = liquidity_cost(h, adv*sc["adv_mult"], sd*sc["vol_mult"],
+                                lam*sc["lambda_mult"])
+        total_mtm += mtm; total_stress_lc += slc
+        rows_sc.append({
+            "Asset":a, "Position":money(h),
+            "Shock":f"{shock*100:+.0f}%", "MTM P&L":money(mtm),
+            "Stressed ADV":money(adv*sc["adv_mult"]),
+            "Stressed σ":f"{sd*sc['vol_mult']*100:.2f}%",
+            "Stressed λ":f"{lam*sc['lambda_mult']:.2f}",
+            "Stressed LC":money(slc),
+            "Total loss":money(mtm-slc),
+        })
+    total_loss = abs(total_mtm)+total_stress_lc
 
-### 2. Three Value-at-Risk Estimators (compared in Tab 2)
-- **Historical Simulation**: $\text{VaR}_\alpha = -Q_{1-\alpha}(\{r_t\})$ — non-parametric, fully data-driven.
-- **Parametric (Gaussian)**: $\text{VaR}_\alpha = -(\mu + z_{1-\alpha}\sigma)$ — closed-form but assumes normality.
-- **Cornish-Fisher (1937)**: corrects the Gaussian quantile for empirical skewness $s$ and excess kurtosis $k$:
-$$
-z_{CF} = z + \tfrac{(z^2-1)s}{6} + \tfrac{(z^3-3z)k}{24} - \tfrac{(2z^3-5z)s^2}{36}
-$$
-Captures crypto's well-documented **fat left tails** while remaining parametric. Favoured in practice when historical samples are short.
+    s1, s2, s3 = st.columns(3)
+    s1.metric("MTM P&L",    money(total_mtm),       "Shock leg")
+    s2.metric("Stressed LC",money(total_stress_lc),  "Fire-sale leg")
+    s3.metric("Total loss", money(-total_loss),       f"{total_loss/AUM*100:.1f}% AUM")
 
-### 3. Expected Shortfall (Conditional VaR)
-$$\text{ES}_\alpha = -\mathbb{E}[\,r \mid r \le -\text{VaR}_\alpha\,]$$
-A **coherent** risk measure (Artzner et al., 1999) — satisfies sub-additivity, unlike VaR. Adopted by Basel III's FRTB as the principal market-risk metric.
+    cumulative = total_mtm - total_stress_lc
+    fig_w = go.Figure(go.Waterfall(
+        orientation="v",
+        measure=["relative","relative","total"],
+        x=["MTM P&L","Stressed LC","Total stressed loss"],
+        text=[money(total_mtm), money(-total_stress_lc), money(cumulative)],
+        y=[total_mtm, -total_stress_lc, cumulative],
+        textposition="outside",
+        connector={"line":{"color":"#888"}},
+    ))
+    fig_w.update_layout(title=f"{scenario} — loss decomposition",
+                        template="plotly_white", height=420, yaxis_title="USD",
+                        margin=dict(t=60, b=80))
+    st.plotly_chart(fig_w, use_container_width=True)
+    st.dataframe(pd.DataFrame(rows_sc), hide_index=True, use_container_width=True)
 
-### 4. Backtesting — Kupiec (1995) Proportion-of-Failures
-Likelihood-ratio test of unconditional coverage. Under H₀, the violation count follows a binomial distribution with parameter $1-\alpha$. We reject if
-$$
-LR_{POF} = -2 \ln\!\left[\frac{(1-p)^{n-x}\,p^x}{(1-\hat\pi)^{n-x}\,\hat\pi^x}\right] > \chi^2_1(0.95) = 3.84.
-$$
-Implemented with a 250-day rolling forecast window.
+    base_var = hist_var(port_ret, alpha)*AUM if not port_ret.empty else 0
+    base_lc  = sum(liquidity_cost(
+                    holdings.get(a,0),
+                    float(latest.loc[a,"adv_30_usd"]) if a in latest.index else 0,
+                    FEATURES[FEATURES["asset"]==a]["return"].std(ddof=1), lam)
+                   for a in ASSETS if a in latest.index)
+    fig_cmp = go.Figure([
+        go.Bar(name="Std VaR/shock", x=["Base","Stressed"],
+               y=[base_var, abs(total_mtm)], marker_color="#c0392b"),
+        go.Bar(name="Liq. cost",     x=["Base","Stressed"],
+               y=[base_lc, total_stress_lc], marker_color="#e67e22"),
+    ])
+    fig_cmp.update_layout(barmode="stack", title="Base vs stressed",
+                          template="plotly_white", height=320, yaxis_title="USD")
+    st.plotly_chart(fig_cmp, use_container_width=True)
 
-### 5. Component VaR (Euler Decomposition)
-Under Gaussian assumptions, portfolio VaR is **homogeneous of degree 1** in weights, so by Euler's theorem:
-$$
-\text{VaR}_p = \sum_i w_i \cdot \frac{\partial \text{VaR}_p}{\partial w_i}, \qquad
-\text{Component VaR}_i = -z_{1-\alpha} \cdot \frac{w_i\,(\Sigma w)_i}{\sigma_p}.
-$$
-Surfaces **risk concentration** independent of capital allocation.
 
-### 6. Liquidity-Adjusted VaR — Bangia et al. (1999), Almgren-Chriss (2000)
-The project's flagship contribution. Standard VaR assumes positions can be exited at the prevailing mid-price; for institutional-scale crypto positions this is unrealistic. We add a closed-form **endogenous liquidity premium**:
-$$
-\text{Liquidity Cost}_i = \lambda \cdot \frac{P_i}{\text{ADV}_i} \cdot \sigma_i \cdot P_i, \qquad
-\text{L-VaR}_i = \text{VaR}_i + \text{Liquidity Cost}_i,
-$$
-where $P_i$ is position size in USD, $\text{ADV}_i$ is the trailing 30-day average daily volume, $\sigma_i$ is annualized volatility, and $\lambda \in [0.1, 2.0]$ is the **market-impact coefficient** (a Kyle-1985-style price-pressure parameter).
+# ──────────── TAB 5: Methodology ────────────
+with tab_meth:
+    st.subheader("🔬 Risk Methodology")
+    st.markdown("""
+Three VaR estimators (Historical Simulation, Parametric Normal, Cornish-Fisher),
+Expected Shortfall (CVaR), Bootstrap CI (n=1,000), Kupiec POF backtest,
+Component VaR (Euler allocation), Liquidity-adjusted VaR (L-VaR), 4 stress scenarios.
 
-The formulation collapses to the **Almgren-Chriss linear temporary-impact model** when $\lambda$ is interpreted as twice the impact coefficient.
+**Annualisation:** σ\_annual = σ\_daily × √365  
+*(crypto markets trade 24/7, 365 days/year; cf. √252 for equities)*
 
-### 7. Stress Testing
-Each scenario applies (a) a price shock vector $\{\delta_i\}$, (b) an ADV haircut $a \in (0,1]$ proxying market thinning, and (c) a $\lambda$ multiplier $\mu_\lambda \ge 1$ proxying impact amplification. Total stressed loss:
-$$
-\mathcal{L}_{stressed} = \Big|\sum_i P_i \delta_i\Big| + \sum_i \mu_\lambda \lambda \cdot \frac{P_i}{a\,\text{ADV}_i} \cdot \sigma_i \cdot P_i.
-$$
+**Cornish-Fisher VaR:**  
+z\* = z + (z²−1)·γ₁/6 + (z³−3z)·γ₂/24 − (2z³−5z)·γ₁²/36  
+where γ₁ = skewness, γ₂ = excess kurtosis, z = Φ⁻¹(α)
 
----
+**Liquidity Cost (Kyle 1985 / Almgren-Chriss 2000, simplified):**  
+LC = λ · (Position / ADV) · σ · Position = λ · σ · Position² / ADV  
+*[quadratic in position size; λ = price-impact coefficient; ADV = 30-day average daily volume in USD]*
 
-### References
-1. **Bangia, A., Diebold, F. X., Schuermann, T., & Stroughair, J.** (1999). *Modeling liquidity risk, with implications for traditional market risk measurement and management*. The Wharton Financial Institutions Center, Working Paper 99-06.
-2. **Almgren, R., & Chriss, N.** (2000). *Optimal execution of portfolio transactions*. Journal of Risk, 3(2), 5–39.
-3. **Kupiec, P. H.** (1995). *Techniques for verifying the accuracy of risk measurement models*. Journal of Derivatives, 3(2), 73–84.
-4. **Artzner, P., Delbaen, F., Eber, J. M., & Heath, D.** (1999). *Coherent measures of risk*. Mathematical Finance, 9(3), 203–228.
-5. **Cornish, E. A., & Fisher, R. A.** (1937). *Moments and cumulants in the specification of distributions*. Revue de l'Institut International de Statistique, 5(4), 307–320.
-6. **Kyle, A. S.** (1985). *Continuous auctions and insider trading*. Econometrica, 53(6), 1315–1335.
-7. **Brunnermeier, M. K., & Pedersen, L. H.** (2009). *Market liquidity and funding liquidity*. Review of Financial Studies, 22(6), 2201–2238.
-8. **Basel Committee on Banking Supervision** (2019). *Minimum capital requirements for market risk*. BCBS d457.
+**L-VaR (Liquidity-adjusted VaR):** L-VaR = Std VaR + LC
 
-### Limitations & Caveats
-- **Linear** market-impact model; reality is concave for very large orders (Almgren et al., 2005).
-- Historical / Cornish-Fisher VaR assume the past distribution repeats — supplement with stress tests.
-- Cross-asset liquidity correlations ignored; in panics they spike together (Brunnermeier & Pedersen, 2009).
-- ADV proxied by 30-day average dollar volume from Yahoo Finance; institutional flows often clear off-screen (OTC / RFQ).
-- Single-day horizon; multi-day VaR via $\sqrt{T}$ scaling is fragile under volatility clustering and crisis-time autocorrelation.
-    """)
+**Risk Regime classification (1-day portfolio return r):**  
+Crisis r < −5% │ High Risk r < −3% │ Elevated r < −1.5% │ Moderate −1.5% ≤ r < 0% │ Stable 0% ≤ r < +1.5% │ Bull r ≥ +1.5%
+""")
+    st.subheader("📚 References")
+    refs = [
+        "Bangia, Diebold, Schuermann & Stroughair (1999). Modeling Liquidity Risk. Wharton FIC Working Paper 99-06.",
+        "Almgren, R. & Chriss, N. (2000). Optimal execution of portfolio transactions. Journal of Risk, 3(2), 5–39.",
+        "Kyle, A. S. (1985). Continuous auctions and insider trading. Econometrica, 53(6), 1315–1335.",
+        "Kupiec, P. H. (1995). Techniques for verifying VaR models. Journal of Derivatives, 3(2), 73–84.",
+        "Artzner et al. (1999). Coherent measures of risk. Mathematical Finance, 9(3), 203–228.",
+        "Cornish & Fisher (1937). Moments and cumulants. Revue de l'Institut International de Statistique.",
+        "Brunnermeier & Pedersen (2009). Market liquidity and funding liquidity. RFS, 22(6), 2201–2238.",
+        "BCBS (2019). Minimum capital requirements for market risk. BIS document d457.",
+    ]
+    for i, r in enumerate(refs, 1):
+        st.markdown(f"{i}. {r}")
 
-st.markdown("---")
-st.caption("Built with Streamlit · Data: Yahoo Finance via yfinance · © 2026 Liyan Zeng · Université de Genève")
+st.markdown(
+    "<div style='text-align:center;color:#999;font-size:0.78rem;margin-top:24px'>"
+    "© 2026 Group 3 · UNIGE · Quantitative Risk Management (Spring 26)"
+    "</div>",
+    unsafe_allow_html=True
+)
